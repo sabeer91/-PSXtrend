@@ -1,0 +1,9 @@
+pandas
+numpy
+yfinance
+scipy
+python-dotenv
+requests
+openai
+pyarrow
+fastparquet
