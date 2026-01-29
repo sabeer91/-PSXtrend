@@ -1,156 +1,182 @@
 import os
 import json
+import requests
 import time
-import datetime
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-import requests
 
-# Import our custom modules
+# Import modules
 from pipeline import PSXDataPipeline
 from scanner import StructuralScanner
 from evaluator import AgenticEvaluator
 
-# Load environment variables (API Keys)
+# Load environment variables (for local dev)
+# On GitHub Actions, these are injected automatically from Secrets
 load_dotenv()
 
-# Configuration
+# --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LOG_FILE = "alert_history.json"
+HISTORY_FILE = "alert_history.json"
 
 class TelegramSender:
     def __init__(self, token, chat_id):
         self.token = token
         self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{token}/sendMessage"
-
+    
     def send(self, message):
+        """Sends message to Telegram. Prints to console if creds are missing."""
         if not self.token or not self.chat_id:
-            print("⚠️ Telegram credentials missing. Printing to console.")
-            print(f"\n--- ALERT ---\n{message}\n-------------\n")
+            print(f"\n📢 [CONSOLE ALERT] \n{message}\n")
             return
 
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {
             "chat_id": self.chat_id,
             "text": message,
             "parse_mode": "Markdown"
         }
         try:
-            requests.post(self.base_url, json=payload)
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code != 200:
+                print(f"❌ Telegram Error: {resp.text}")
         except Exception as e:
-            print(f"❌ Failed to send Telegram alert: {e}")
+            print(f"❌ Connection Error: {e}")
 
 class AlertManager:
-    def __init__(self, log_file):
-        self.log_file = Path(log_file)
+    def __init__(self, filepath):
+        self.filepath = Path(filepath)
         self.history = self._load_history()
 
     def _load_history(self):
-        if self.log_file.exists():
-            with open(self.log_file, 'r') as f:
-                return json.load(f)
+        """Loads JSON history. Returns empty dict if file is missing/corrupt."""
+        if self.filepath.exists():
+            try:
+                with open(self.filepath, 'r') as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                print("⚠️ History file corrupted. Starting fresh.")
+                return {}
         return {}
 
     def is_cooling_down(self, symbol, cooldown_days=5):
-        """Prevents spamming the same symbol within X days."""
+        """Returns True if symbol was alerted recently."""
         if symbol in self.history:
-            last_alert = datetime.datetime.fromisoformat(self.history[symbol]['date'])
-            if (datetime.datetime.now() - last_alert).days < cooldown_days:
-                return True
+            try:
+                last_date_str = self.history[symbol]['date']
+                last_date = datetime.fromisoformat(last_date_str)
+                days_diff = (datetime.now() - last_date).days
+                if days_diff < cooldown_days:
+                    return True
+            except (ValueError, KeyError):
+                pass # Invalid date format in file, ignore
         return False
 
     def log_alert(self, symbol, data):
-        """Saves alert to history for future performance review."""
+        """Updates the history file."""
         self.history[symbol] = {
-            "date": datetime.datetime.now().isoformat(),
-            "trigger_price": data['level'],
-            "type": "Breakout",
-            "score": data.get('score', 0) 
+            "date": datetime.now().isoformat(),
+            "level": data['level'],
+            "score": data.get('compression_score', 0)
         }
-        with open(self.log_file, 'w') as f:
+        # Atomic write to avoid corruption
+        with open(self.filepath, 'w') as f:
             json.dump(self.history, f, indent=4)
 
-def llm_wrapper(prompt):
+def generate_llm_summary(prompt):
     """
-    Simple wrapper to call OpenAI. 
-    If no key is found, it returns the structured prompt (Good for debugging).
+    Sends the prompt to OpenAI. 
+    Falls back to returning the prompt itself if Key is missing or API fails.
     """
     if not OPENAI_API_KEY:
-        return f"⚠️ [NO AI KEY] Raw Logic Output:\n\n{prompt}"
-    
+        return f"⚠️ **(No AI Key)** - Raw Signal:\n{prompt}"
+
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
+        
         response = client.chat.completions.create(
-            model="gpt-4-turbo",
+            model="gpt-4", # Or "gpt-3.5-turbo" for lower cost
             messages=[
-                {"role": "system", "content": "You are a succinct financial risk analyst."},
+                {"role": "system", "content": "You are a succinct financial risk analyst. Output in Markdown."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3
+            temperature=0.3,
+            max_tokens=250
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"⚠️ AI Generation Failed: {e}\n\nFalling back to raw prompt:\n{prompt}"
+        print(f"❌ OpenAI Error: {e}")
+        return f"⚠️ **AI Error** - Raw Signal:\n{prompt}"
 
 def main():
     print("🚀 Starting PSX Regime Shift Detector...")
     
-    # 1. Initialize Components
+    # 1. Init Components
     pipeline = PSXDataPipeline()
     telegram = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-    manager = AlertManager(LOG_FILE)
+    manager = AlertManager(HISTORY_FILE)
     
-    # 2. Update Data
-    # pipeline.update_universe() # Uncomment this to run the download daily
+    # 2. Fetch Data (In-Memory)
+    # This returns a Dict { 'SYS': dataframe, ... }
+    # optimized for cloud so we don't read/write to disk
+    market_data = pipeline.update_universe()
     
-    # 3. Analyze Market Regime
+    if not market_data:
+        print("❌ No data fetched. Aborting.")
+        return
+
+    # 3. Assess Market Regime
     evaluator = AgenticEvaluator(pipeline)
-    print(f"🌍 Market Regime: {evaluator.market_regime['status']}")
+    regime = evaluator.market_regime
+    print(f"🌍 Market Regime: {regime['status']} (Vol Multiplier: {regime['vol_mult']}x)")
     
-    # 4. Iterate Universe
-    alerts_generated = 0
-    
-    for symbol in pipeline.universe:
-        clean_symbol = symbol.replace(".KA", "") # Internal use
-        
+    alerts_triggered = 0
+
+    # 4. Scan the Universe
+    for symbol, df in market_data.items():
         # A. Check Cooldown
-        if manager.is_cooling_down(clean_symbol):
+        if manager.is_cooling_down(symbol):
             continue
 
-        # B. Load Data
-        df = pipeline.load_data(clean_symbol)
-        if df is None: continue
-
-        # C. Run Quantitative Scanner
+        # B. Run Math Scanner
         scanner = StructuralScanner(df)
         breakout_candidates = scanner.evaluate_breakout()
         
         if not breakout_candidates:
             continue
 
-        # D. Run Structural Zones (Need this for context in Evaluator)
+        # C. Get Zones (for context)
         zones = scanner._find_structural_zones()
 
-        # E. Evaluate Candidates
+        # D. Agentic Evaluation
         for candidate in breakout_candidates:
-            # The Evaluator decides if it's worthy and creates the Prompt
-            alert_prompt = evaluator.evaluate_signal(clean_symbol, candidate, zones)
+            # The Evaluator applies the "Context" filter (Regime + Location)
+            alert_prompt = evaluator.evaluate_signal(symbol, candidate, zones)
             
             if alert_prompt:
-                print(f"🔔 Signal Detected: {clean_symbol}")
+                print(f"🔔 Breakout Detected: {symbol}")
                 
-                # F. Generate Narrative via LLM
-                final_message = llm_wrapper(alert_prompt)
+                # E. LLM Narrative
+                final_message = generate_llm_summary(alert_prompt)
                 
-                # G. Send & Log
+                # F. Send & Log
                 telegram.send(final_message)
-                manager.log_alert(clean_symbol, candidate)
-                alerts_generated += 1
-    
-    print(f"✅ Run Complete. Generated {alerts_generated} alerts.")
+                manager.log_alert(symbol, candidate)
+                alerts_triggered += 1
+                
+                # Sleep briefly to avoid Telegram rate limits
+                time.sleep(1)
+
+    # 5. Final Report
+    if alerts_triggered == 0:
+        print("✅ Scan Complete. No structural breakouts detected today.")
+        # Optional: Send a "Heartbeat" message to know it ran
+        # telegram.send(f"✅ Daily Scan Complete. Market: {regime['status']}. No signals.")
+    else:
+        print(f"✅ Scan Complete. Sent {alerts_triggered} alerts.")
 
 if __name__ == "__main__":
     main()
